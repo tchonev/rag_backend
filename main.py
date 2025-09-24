@@ -47,7 +47,7 @@ class ContextResponse(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., description="User query")
     similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=4000, ge=100, le=8000, description="Max tokens for model context")
+    max_tokens: int = Field(default=1800, ge=100, le=1800, description="Max tokens for model context")
     # Optional override to test /query without hitting DB/embeddings
     context_override: Optional[ContextResponse] = None
 
@@ -329,6 +329,11 @@ def retrieve_context_logic(query: str, similarity_threshold: float) -> ContextRe
         sum(c.similarity_score for c in similar_chunks) / len(similar_chunks)
     ) if similar_chunks else 0.0
 
+    #This is a quick and dirty fix to avoid overloading the model with too big a context and hanging
+    if len(context) > 6000:  # Roughly 2000 tokens
+        context = context[:6000] + "\n[Context truncated due to length]"
+
+
     return ContextResponse(
         strategy=strategy,
         document_count=doc_count,
@@ -432,8 +437,6 @@ QUESTION: {request.query}
 ANSWER:"""
 
     prompt = make_prompt(context)
-
-    # 3) Tokenize with attention_mask (no more EOS-as-PAD warnings)
     device = next(llm_model.parameters()).device
     tok_out = llm_tokenizer(
         prompt,
@@ -444,12 +447,9 @@ ANSWER:"""
     input_ids = tok_out["input_ids"].to(device)
     attention_mask = tok_out["attention_mask"].to(device)
 
-    # 4) Ensure prompt fits within budget, leaving space for the answer
     reserve_for_answer = 300
-    max_input_tokens = max(128, request.max_tokens - reserve_for_answer)
+    max_input_tokens = max(300, request.max_tokens - reserve_for_answer)
 
-    # If prompt too long, iteratively truncate context by halves until it fits
-    # (Simple and robust for now; you can swap with token-aware truncation later)
     while int(input_ids.shape[-1]) > max_input_tokens and "\n" in context:
         lines = context.split("\n")
         # keep first half
@@ -459,32 +459,31 @@ ANSWER:"""
         input_ids = tok_out["input_ids"].to(device)
         attention_mask = tok_out["attention_mask"].to(device)
 
-    # 5) Generate
     logger.info(f"Prompt tokens: {int(input_ids.shape[-1])}")
 
     with torch.no_grad():
         outputs = llm_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=128,  # was up to 300 — 128 is plenty for answers
-            do_sample=False,  # deterministic & faster (no top_p, temperature)
+            max_new_tokens=300,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
             pad_token_id=llm_tokenizer.pad_token_id,
             eos_token_id=llm_tokenizer.eos_token_id,
         )
 
-    # 6) Decode only the newly generated tokens (drop the prompt prefix)
     prompt_len = int(input_ids.shape[-1])
     generated = outputs[0][prompt_len:]
     answer = llm_tokenizer.decode(generated, skip_special_tokens=True).strip()
     if answer.startswith("ANSWER:"):
         answer = answer[7:].strip()
 
-    # 7) Token counts for metadata
     prompt_tokens = prompt_len
     response_tokens = int(generated.shape[-1])
     total_tokens = prompt_tokens + response_tokens
 
-    # 8) Return
     return QueryResponse(
         query=request.query,
         context=context_resp.context,  # return original full context for transparency
