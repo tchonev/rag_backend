@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Query Interface</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+
+        .main-content {
+            padding: 40px;
+        }
+
+        .query-section {
+            margin-bottom: 30px;
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #374151;
+            font-size: 1.1em;
+        }
+
+        .query-input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 1em;
+            transition: all 0.3s ease;
+            resize: vertical;
+            min-height: 120px;
+            font-family: inherit;
+        }
+
+        .query-input:focus {
+            outline: none;
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+            transform: translateY(-2px);
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .slider {
+            flex: 1;
+            height: 8px;
+            border-radius: 4px;
+            background: #e5e7eb;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #4f46e5;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(79, 70, 229, 0.3);
+            transition: all 0.2s ease;
+        }
+
+        .slider::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
+        }
+
+        .slider::-moz-range-thumb {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #4f46e5;
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 2px 8px rgba(79, 70, 229, 0.3);
+        }
+
+        .slider-value {
+            background: #f3f4f6;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-weight: 600;
+            color: #4f46e5;
+            min-width: 60px;
+            text-align: center;
+        }
+
+        .submit-btn {
+            background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 12px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(79, 70, 229, 0.3);
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(79, 70, 229, 0.4);
+        }
+
+        .submit-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border-radius: 12px;
+            margin: 20px 0;
+            border: 2px dashed #cbd5e1;
+        }
+
+        .spinner-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+
+        .spinner {
+            border: 4px solid #e5e7eb;
+            border-top: 4px solid #4f46e5;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+
+        .dots {
+            display: flex;
+            gap: 4px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4f46e5;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .dot:nth-child(1) { animation-delay: -0.32s; }
+        .dot:nth-child(2) { animation-delay: -0.16s; }
+        .dot:nth-child(3) { animation-delay: 0s; }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        @keyframes bounce {
+            0%, 80%, 100% { 
+                transform: scale(0);
+                opacity: 0.5;
+            } 
+            40% { 
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .loading-text {
+            font-size: 1.1em;
+            font-weight: 600;
+            color: #4f46e5;
+            margin-bottom: 8px;
+        }
+
+        .loading-subtitle {
+            font-size: 0.9em;
+            color: #6b7280;
+            font-style: italic;
+        }
+
+        .results {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .result-section {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid #4f46e5;
+        }
+
+        .result-title {
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 10px;
+            font-size: 1.2em;
+        }
+
+        .result-content {
+            color: #4b5563;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .metadata-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .metadata-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+        }
+
+        .metadata-label {
+            font-size: 0.9em;
+            color: #6b7280;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .metadata-value {
+            font-weight: 600;
+            color: #1f2937;
+            font-size: 1.1em;
+        }
+
+        .error {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #dc2626;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                padding: 20px;
+            }
+            
+            .metadata-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .slider-container {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 RAG Query Interface</h1>
+            <p>Ask questions and get AI-powered responses with context</p>
+        </div>
+        
+        <div class="main-content">
+            <div class="query-section">
+                <form id="queryForm">
+                    <div class="form-group">
+                        <label for="queryInput">Your Question:</label>
+                        <textarea 
+                            id="queryInput" 
+                            class="query-input" 
+                            placeholder="Ask me anything about the documents..."
+                            required
+                        ></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="similaritySlider">Similarity Threshold:</label>
+                        <div class="slider-container">
+                            <input 
+                                type="range" 
+                                id="similaritySlider" 
+                                class="slider" 
+                                min="0.3" 
+                                max="0.9" 
+                                step="0.05" 
+                                value="0.7"
+                            >
+                            <div class="slider-value" id="sliderValue">0.70</div>
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="submit-btn" id="submitBtn">
+                        Ask Question
+                    </button>
+                </form>
+            </div>
+
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Processing your question...</p>
+            </div>
+
+            <div class="error" id="error"></div>
+
+            <div class="results" id="results">
+                <div class="result-section">
+                    <div class="result-title">🎯 Response</div>
+                    <div class="result-content" id="responseContent"></div>
+                </div>
+
+                <div class="result-section">
+                    <div class="result-title">📚 Context</div>
+                    <div class="result-content" id="contextContent"></div>
+                </div>
+
+                <div class="result-section">
+                    <div class="result-title">📊 Metadata</div>
+                    <div class="metadata-grid" id="metadataGrid"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Update slider value display
+        const slider = document.getElementById('similaritySlider');
+        const sliderValue = document.getElementById('sliderValue');
+        
+        slider.addEventListener('input', function() {
+            sliderValue.textContent = parseFloat(this.value).toFixed(2);
+        });
+
+        // Handle form submission
+        const form = document.getElementById('queryForm');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+        const error = document.getElementById('error');
+        const submitBtn = document.getElementById('submitBtn');
+
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const query = document.getElementById('queryInput').value.trim();
+            const similarityThreshold = parseFloat(slider.value);
+            
+            if (!query) {
+                showError('Please enter a question');
+                return;
+            }
+
+            // Show loading state
+            loading.style.display = 'block';
+            results.style.display = 'none';
+            error.style.display = 'none';
+            submitBtn.disabled = true;
+
+            try {
+                const response = await fetch('http://localhost:8000/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        similarity_threshold: similarityThreshold
+                    })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                displayResults(data);
+
+            } catch (err) {
+                console.error('Error:', err);
+                showError(`Failed to get response: ${err.message}`);
+            } finally {
+                loading.style.display = 'none';
+                submitBtn.disabled = false;
+            }
+        });
+
+        function displayResults(data) {
+            // Display response
+            document.getElementById('responseContent').textContent = data.response || 'No response received';
+            
+            // Display context
+            document.getElementById('contextContent').textContent = data.context || 'No context available';
+            
+            // Display metadata
+            const metadataGrid = document.getElementById('metadataGrid');
+            metadataGrid.innerHTML = '';
+            
+            if (data.metadata) {
+                const metadata = data.metadata;
+                
+                const metadataItems = [
+                    { label: 'Chunks Found', value: metadata.chunk_count || 'N/A' },
+                    { label: 'Avg Similarity', value: metadata.avg_similarity ? metadata.avg_similarity.toFixed(3) : 'N/A' },
+                    { label: 'Threshold Used', value: metadata.similarity_threshold ? metadata.similarity_threshold.toFixed(2) : 'N/A' },
+                    { label: 'Context Length', value: metadata.context_length || 'N/A' },
+                    { label: 'Context Truncated', value: metadata.context_truncated ? 'Yes' : 'No' },
+                    { label: 'Prompt Tokens', value: metadata.prompt_tokens || 'N/A' },
+                    { label: 'Response Tokens', value: metadata.response_tokens || 'N/A' },
+                    { label: 'Total Tokens', value: metadata.total_tokens || 'N/A' },
+                    { label: 'Initial Matches', value: metadata.initial_matches || 'N/A' },
+                    { label: 'Processing Time', value: metadata.processing_time_ms ? `${metadata.processing_time_ms.toFixed(1)}ms` : 'N/A' }
+                ];
+
+                metadataItems.forEach(item => {
+                    const metadataItem = document.createElement('div');
+                    metadataItem.className = 'metadata-item';
+                    metadataItem.innerHTML = `
+                        <div class="metadata-label">${item.label}</div>
+                        <div class="metadata-value">${item.value}</div>
+                    `;
+                    metadataGrid.appendChild(metadataItem);
+                });
+            }
+
+            results.style.display = 'block';
+        }
+
+        function showError(message) {
+            error.textContent = message;
+            error.style.display = 'block';
+            results.style.display = 'none';
+        }
+
+        // Add some example queries for better UX
+        const exampleQueries = [
+            "What is the main topic of the document?",
+            "Can you summarize the key findings?",
+            "What are the important conclusions?"
+        ];
+
+        // Optionally add example buttons
+        const queryInput = document.getElementById('queryInput');
+        queryInput.addEventListener('focus', function() {
+            if (!this.value) {
+                this.placeholder = `Try: "${exampleQueries[Math.floor(Math.random() * exampleQueries.length)]}"`;
+            }
+        });
+    </script>
+</body>
+</html>
