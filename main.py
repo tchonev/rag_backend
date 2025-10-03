@@ -47,8 +47,6 @@ class ContextResponse(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., description="User query")
     similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=1800, ge=100, le=1800, description="Max tokens for model context")
-    # Optional override to test /query without hitting DB/embeddings
     context_override: Optional[ContextResponse] = None
 
 
@@ -95,13 +93,15 @@ async def lifespan(app: FastAPI):
         llm_tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
         llm_model = AutoModelForCausalLM.from_pretrained(
             "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
+            torch_dtype=torch.float16,
+            device_map="auto",
         )
+
         # Ensure pad token
         if llm_tokenizer.pad_token_id is None:
             llm_tokenizer.pad_token = llm_tokenizer.eos_token
-        logger.info("TinyLlama loaded")
+
+        logger.info(f"TinyLlama loaded on: {next(llm_model.parameters()).device}")
 
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
@@ -312,7 +312,65 @@ def format_context(chunks: List[DocumentChunk]) -> str:
     return "\n".join(parts).strip()
 
 
-def retrieve_context_logic(query: str, similarity_threshold: float) -> ContextResponse:
+def truncate_chunks_by_tokens(chunks: List[DocumentChunk], max_tokens: int, strategy: str) -> List[DocumentChunk]:
+    """
+    Truncate chunks to fit within token budget.
+
+    Strategy-aware:
+    - full_document: Keep chunks in order, truncate from END (preserve document flow)
+    - individual_chunks: Keep highest similarity chunks (already sorted by similarity)
+    """
+    if not chunks or not llm_tokenizer:
+        return chunks
+
+    # Reserve tokens for document headers and formatting
+    OVERHEAD_PER_DOC = 50  # "Document: X (Industries: ...) \n===\n"
+    OVERHEAD_PER_CHUNK = 20  # "[Pages: X]\n\n---\n"
+
+    # For full_document: chunks are in sequential order, keep from start
+    # For individual_chunks: chunks are already sorted by similarity, iterate as-is
+
+    selected_chunks: List[DocumentChunk] = []
+    total_tokens = 0
+    doc_titles_seen = set()
+
+    for chunk in chunks:
+        # Estimate overhead for new document header
+        overhead = 0
+        if chunk.title not in doc_titles_seen:
+            overhead += OVERHEAD_PER_DOC
+            doc_titles_seen.add(chunk.title)
+        overhead += OVERHEAD_PER_CHUNK
+
+        # Count tokens in chunk content
+        chunk_tokens = len(llm_tokenizer.encode(chunk.content, add_special_tokens=False))
+
+        if total_tokens + chunk_tokens + overhead <= max_tokens:
+            selected_chunks.append(chunk)
+            total_tokens += chunk_tokens + overhead
+        else:
+            # Budget exhausted
+            if strategy == "full_document" and not selected_chunks:
+                # Special case: if even first chunk doesn't fit, truncate it
+                available_tokens = max_tokens - overhead
+                if available_tokens > 100:  # Minimum useful size
+                    tokens = llm_tokenizer.encode(chunk.content, add_special_tokens=False)[:available_tokens]
+                    truncated_content = llm_tokenizer.decode(tokens, skip_special_tokens=True)
+                    chunk.content = truncated_content + "\n[...truncated]"
+                    selected_chunks.append(chunk)
+            break
+
+    if strategy == "full_document":
+        logger.info(
+            f"Token truncation (full_document): kept first {len(selected_chunks)}/{len(chunks)} chunks (~{total_tokens} tokens)")
+    else:
+        logger.info(
+            f"Token truncation (individual_chunks): kept top {len(selected_chunks)}/{len(chunks)} chunks by similarity (~{total_tokens} tokens)")
+
+    return selected_chunks
+
+
+def retrieve_context_logic(query: str, similarity_threshold: float, max_context_tokens: int) -> ContextResponse:
     """Pure function used by both endpoints (and by tests)"""
     start_time = time.time()
 
@@ -322,6 +380,10 @@ def retrieve_context_logic(query: str, similarity_threshold: float) -> ContextRe
     if strategy == "full_document" and selected_document:
         final_chunks = get_full_document(selected_document)
 
+    # Token-aware truncation (respects strategy)
+    if llm_tokenizer is not None:
+        final_chunks = truncate_chunks_by_tokens(final_chunks, max_context_tokens, strategy)
+
     context = format_context(final_chunks)
     processing_time = (time.time() - start_time) * 1000.0
     doc_count = len({c.title for c in final_chunks}) if final_chunks else 0
@@ -330,8 +392,8 @@ def retrieve_context_logic(query: str, similarity_threshold: float) -> ContextRe
     ) if similar_chunks else 0.0
 
     #This is a quick and dirty fix to avoid overloading the model with too big a context and hanging
-    if len(context) > 6000:  # Roughly 2000 tokens
-        context = context[:6000] + "\n[Context truncated due to length]"
+    # if len(context) > 6000:  # Roughly 2000 tokens
+    #     context = context[:6000] + "\n[Context truncated due to length]"
 
 
     return ContextResponse(
@@ -385,22 +447,48 @@ def retrieve_context(request: ContextRequest):
 @app.post("/query", response_model=QueryResponse, tags=["Query Processing"])
 async def query_endpoint(request: QueryRequest):
     """
-    Answer a query using context from retrieval (or an injected override for tests).
-    - Uses tokenizer() (not encode) so we get attention_mask.
-    - Uses input_ids.shape[-1] instead of len(inputs[0]).
-    - Properly captures 'outputs' from generate and decodes only new tokens.
-    - Truncates context if prompt would exceed token budget.
+    Answer a query using context from retrieval.
+    Context is pre-truncated by token count to fit model capacity.
     """
     global llm_model, llm_tokenizer
 
     if llm_model is None or llm_tokenizer is None:
         raise HTTPException(status_code=500, detail="LLM not loaded")
 
-    # 1) Context: use override if provided, else compute
+    logger.info(f"=== Starting query: {request.query[:50]}...")
+
+    MODEL_MAX_TOKENS = 2048
+    RESERVE_FOR_SYSTEM_PROMPT = 180  # System instructions + formatting
+    RESERVE_FOR_GENERATION = 400
+
+    # 1) Measure actual query length
+    query_tokens = len(llm_tokenizer.encode(request.query, add_special_tokens=False))
+    logger.info(f"Query tokens: {query_tokens}")
+
+    # 2) Calculate dynamic context budget
+    MAX_CONTEXT_TOKENS = MODEL_MAX_TOKENS - RESERVE_FOR_SYSTEM_PROMPT - query_tokens - RESERVE_FOR_GENERATION
+
+    # Safety check - ensure we have reasonable room for context
+    if MAX_CONTEXT_TOKENS < 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Query too long ({query_tokens} tokens). Maximum query length is ~{MODEL_MAX_TOKENS - RESERVE_FOR_SYSTEM_PROMPT - RESERVE_FOR_GENERATION - 200} tokens."
+        )
+
+    logger.info(f"Token budget - System: {RESERVE_FOR_SYSTEM_PROMPT}, Query: {query_tokens}, Context: {MAX_CONTEXT_TOKENS}, Generation: {RESERVE_FOR_GENERATION}")
+
+
+    # 1) Context: use override if provided, else compute with token limit
     if request.context_override is not None:
         context_resp = request.context_override
     else:
-        context_resp = retrieve_context_logic(request.query, request.similarity_threshold)
+        logger.info("Retrieving context...")
+        context_resp = retrieve_context_logic(
+            request.query,
+            request.similarity_threshold,
+            max_context_tokens=MAX_CONTEXT_TOKENS
+        )
+        logger.info(f"Context retrieved: {len(context_resp.context)} chars, {context_resp.chunk_count} chunks")
 
     context = context_resp.context
     metadata = context_resp.metadata
@@ -425,47 +513,54 @@ INSTRUCTIONS:
     elif chunk_count < 2:
         context_quality_note = f"\nNOTE: Only {chunk_count} relevant document chunk(s) were found. The answer may be incomplete."
 
-    def make_prompt(ctx: str) -> str:
-        return f"""{system_prompt}
+    prompt = f"""{system_prompt}
 
 CONTEXT:
-{ctx}
+{context}
 {context_quality_note}
 
 QUESTION: {request.query}
 
 ANSWER:"""
 
-    prompt = make_prompt(context)
+    logger.info(f"Prompt built: {len(prompt)} chars")
+
+    # 3) Tokenize prompt
+    logger.info("Tokenizing prompt...")
     device = next(llm_model.parameters()).device
     tok_out = llm_tokenizer(
         prompt,
         return_tensors="pt",
         padding=True,
-        truncation=False  # we'll manage truncation manually to keep room for generation
+        truncation=False
     )
     input_ids = tok_out["input_ids"].to(device)
     attention_mask = tok_out["attention_mask"].to(device)
 
-    reserve_for_answer = 300
-    max_input_tokens = max(300, request.max_tokens - reserve_for_answer)
+    prompt_len = int(input_ids.shape[-1])
+    logger.info(f"Tokenization complete: {prompt_len} tokens")
 
-    while int(input_ids.shape[-1]) > max_input_tokens and "\n" in context:
-        lines = context.split("\n")
-        # keep first half
-        context = "\n".join(lines[: max(1, len(lines) // 2)]) + "\n[Context truncated...]"
-        prompt = make_prompt(context)
-        tok_out = llm_tokenizer(prompt, return_tensors="pt", padding=True, truncation=False)
-        input_ids = tok_out["input_ids"].to(device)
-        attention_mask = tok_out["attention_mask"].to(device)
+    # 4) Calculate available tokens for generation
+    tokens_available_for_generation = MODEL_MAX_TOKENS - prompt_len
+    max_new_tokens = min(RESERVE_FOR_GENERATION, tokens_available_for_generation)
 
-    logger.info(f"Prompt tokens: {int(input_ids.shape[-1])}")
+    logger.info(
+        f"Prompt: {prompt_len} tokens, Generation budget: {max_new_tokens} tokens, Available: {tokens_available_for_generation}")
 
+    # Safety check
+    if max_new_tokens < 50:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prompt too long ({prompt_len} tokens). Only {max_new_tokens} tokens left for generation."
+        )
+
+    # 5) Generate answer
+    logger.info("Starting generation...")
     with torch.no_grad():
         outputs = llm_model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=300,
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.7,
             top_p=0.9,
@@ -473,34 +568,33 @@ ANSWER:"""
             pad_token_id=llm_tokenizer.pad_token_id,
             eos_token_id=llm_tokenizer.eos_token_id,
         )
+    logger.info("Generation complete!")
 
-    prompt_len = int(input_ids.shape[-1])
+    # 6) Decode
     generated = outputs[0][prompt_len:]
     answer = llm_tokenizer.decode(generated, skip_special_tokens=True).strip()
+
     if answer.startswith("ANSWER:"):
         answer = answer[7:].strip()
 
-    prompt_tokens = prompt_len
     response_tokens = int(generated.shape[-1])
-    total_tokens = prompt_tokens + response_tokens
+    logger.info(f"Response: {response_tokens} tokens")
 
     return QueryResponse(
         query=request.query,
-        context=context_resp.context,  # return original full context for transparency
+        context=context,
         response=answer,
         metadata={
             "chunk_count": chunk_count,
             "avg_similarity": avg_similarity,
             "similarity_threshold": request.similarity_threshold,
-            "context_length": len(context_resp.context),
-            "context_truncated": context != context_resp.context,
-            "prompt_tokens": prompt_tokens,
+            "context_length": len(context),
+            "prompt_tokens": prompt_len,
             "response_tokens": response_tokens,
-            "total_tokens": total_tokens,
-            **metadata,  # keep original retrieval stats
+            "total_tokens": prompt_len + response_tokens,
+            **metadata,
         },
     )
-
 
 
 @app.get("/stats", tags=["Statistics"])
